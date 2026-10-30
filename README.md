@@ -85,9 +85,10 @@ auth  [success=2 default=ignore]          pam_fprintd.so max-tries=3 timeout=-1
 ```
 
 `max-tries` 是失败几次才回落到密码；默认 1 会让一次没按准就跳 PIN。`timeout=-1`
-是「不设指纹窗口」：锁屏后解锁框立刻出现，人可能很久才回来，15 秒的窗口会在回来
-之前就过期（实测 15 秒后只剩 `Verification timed out` 和密码框，再按指纹没反应）。
-失败 3 次后 PAM 照样回落到密码。
+是「不设指纹窗口」：实测 15 秒的窗口会在人回来前过期（只剩 `Verification timed
+out` 和密码框，再按指纹没反应）。真正的上限是解锁框自己——它闲置 60 秒就收起（见
+下），所以指纹阶段最长约 60 秒；收起后动一下键鼠会重新拉起，指纹立刻可用。失败 3
+次后 PAM 照样回落到密码。
 
 ### 锁屏：换掉 slick-greeter
 
