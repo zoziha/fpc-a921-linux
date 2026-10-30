@@ -60,10 +60,10 @@ if [ "$MD5_GOT" != "$MD5_EXPECTED" ]; then
      got      $MD5_GOT
 
    Lenovo may have refreshed the package. A different build of libfpcbep.so is
-   not automatically wrong, but patches/0009 is pinned to the disassembly of
-   this one -- see docs/INVESTIGATION.md section 18.3. It will detect the
-   mismatch at run time and disable itself, which means captures will be
-   rejected again. Read that section before forcing this.
+   not automatically wrong, but patches/0009 and the TLS shim are pinned to the
+   disassembly of this one: the relayout detects a mismatch at run time and
+   disables itself, which means captures are rejected again. Only force this if
+   you are prepared to redo that check.
 
    To use it anyway: FPCBEP_SKIP_MD5=1 ./get-blob.sh
 EOF

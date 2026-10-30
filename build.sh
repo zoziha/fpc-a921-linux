@@ -59,7 +59,8 @@ ERROR: libfpcbep.so not found.
 
       ./get-blob.sh
 
-  See docs/DEVICE.md for what it does and why it is required.
+  It decrypts the capture, runs the biometric algorithm and stores the
+  template; the sensor itself does no matching. See README.md.
 EOF
   exit 1
 fi
