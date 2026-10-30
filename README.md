@@ -104,11 +104,22 @@ printf '[Desktop Entry]\nType=Application\nName=Light Locker (disabled)\nExec=li
 pkill -x light-locker
 nohup xfce4-screensaver >/dev/null 2>&1 &
 xfconf-query -c xfce4-screensaver -p /lock/enabled -n -t bool -s true
+
+install -Dm755 desktop/xfce-lock-dialog ~/.local/bin/xfce-lock-dialog
+install -Dm644 desktop/xfce-lock-dialog.desktop ~/.config/autostart/xfce-lock-dialog.desktop
+nohup ~/.local/bin/xfce-lock-dialog >/dev/null 2>&1 &
 ```
 
 `Ctrl+Alt+L` 由 `xflock4` 处理，它会优先找 `xfce4-screensaver-command`，所以锁屏键
-不用改。撤销：`sudo apt remove xfce4-screensaver`，删掉那个 autostart 文件，再
+不用改。撤销：`sudo apt remove xfce4-screensaver`，删掉那两个 autostart 文件，再
 `light-locker &`。
+
+锁屏后默认只有一层壁纸：解锁框要等键鼠动作才由 `gs_manager_request_unlock()` 弹出，
+这就是「锁了是黑的，动鼠标才出现」的原因。它的 DBus 接口 `SimulateUserActivity`
+（即 `xfce4-screensaver-command -p`）走同一个函数，`desktop/xfce-lock-dialog` 监听
+`ActiveChanged`，一上锁就 poke 一次。实测不碰键鼠，上锁后 2 秒内解锁框、头像和指纹
+提示已在屏上，按压即解锁；快捷键、菜单、挂起前的锁屏都汇到同一个信号上。fprintd
+没带中文翻译，所以这一行提示仍是英文（`Place your finger on the fingerprint reader`）。
 
 登录界面（开机时的 greeter）仍是 slick-greeter，同一条限制仍然存在；锁屏现在不受
 影响。
@@ -123,6 +134,7 @@ fprintd 1.94.3 在客户端 `Claim` 超时后会留下设备占用，Mint 指纹
 ```
 patches/                    0001-0021，逐个可审阅的驱动改动
 docs/A921.md                证据、判断过程、验证命令
+desktop/xfce-lock-dialog    锁屏后立刻弹出解锁框的 DBus 触发器 + autostart 条目
 tools/fpc_tlsclient.c       TLS 客户端 shim（LD_PRELOAD 进 fprintd）
 tools/fpc-offline-harness.c 离线喂帧给 matcher 的 harness
 tools/fpc-feed-preload.c    harness 用的假 mbedtls_ssl_read

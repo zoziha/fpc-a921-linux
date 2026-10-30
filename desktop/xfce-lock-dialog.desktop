@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Show unlock dialog immediately
+Comment=Pop xfce4-screensaver's unlock dialog as soon as the screen locks
+Exec=sh -c 'exec "$HOME/.local/bin/xfce-lock-dialog"'
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

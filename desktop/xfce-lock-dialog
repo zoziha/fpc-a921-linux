@@ -1,0 +1,12 @@
+#!/bin/sh
+# xfce4-screensaver only pops its unlock dialog after user activity, which
+# leaves a black screen after a manual lock until the mouse moves.
+# Ask it to show the dialog (SimulateUserActivity) as soon as it locks.
+dbus-monitor --session "type='signal',interface='org.xfce.ScreenSaver',member='ActiveChanged'" |
+while IFS= read -r line; do
+    case "$line" in
+        *boolean\ true*)
+            xfce4-screensaver-command -p >/dev/null 2>&1
+            ;;
+    esac
+done
