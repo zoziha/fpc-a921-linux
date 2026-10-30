@@ -1,0 +1,86 @@
+Subject: [PATCH] fpcmoh: do not warn when an image-less record returns -6
+
+Every normal a921 press logs two warnings:
+
+  fpc_enclave_process_data (trailing) failed: -6
+  fpc_enclave_process_data (dead pixel header-only) failed: -6
+
+Both records are expected to carry no image data: the trailing record only
+completes the message that was already handed to the enclave, and the
+header-only part of the dead-pixel transfer is, by name, not a picture. The
+enclave answers -6 ("no image in this buffer") for them on every touch, and
+the return value is otherwise unused, so the warnings made a working sensor
+look broken in the journal.
+
+Say so at the call sites instead: pass expected_empty and keep -6 at debug
+level for those two records. Anything else still warns.
+
+
+---
+libfprint/drivers/fpcmoh/fpc.c |   21 +++++++++++++--------
+ 1 file changed, 13 insertions(+), 8 deletions(-)
+
+--- a/libfprint/drivers/fpcmoh/fpc.c
++++ b/libfprint/drivers/fpcmoh/fpc.c
+@@ -231,16 +231,21 @@
+ }
+ 
+ /* fpc_enclave_process_data(), plus the relayout, plus the return value the
+- * driver used to throw away. */
++ * driver used to throw away.
++ *
++ * expected_empty is set for records that carry no image (the trailing record
++ * and the header-only part of a dead-pixel transfer); the enclave answers -6
++ * for those on every press, which made a normal touch look like a failure. */
+ static gint32
+-fpc_process_data (FpiDeviceFpcMoh *self, const char *what)
++fpc_process_data (FpiDeviceFpcMoh *self, const char *what,
++                  gboolean expected_empty)
+ {
+   gint32 status = fpc_enclave_process_data (self->dev_ctx->enclave);
+ 
+-  if (status != 0)
++  if (status != 0 && !(expected_empty && status == -6))
+     fp_warn ("fpc_enclave_process_data (%s) failed: %d", what, status);
+   else
+-    fp_dbg ("fpc_enclave_process_data (%s) -> 0", what);
++    fp_dbg ("fpc_enclave_process_data (%s) -> %d", what, status);
+ 
+   fpc_img_msg_relayout (self);
+ 
+@@ -535,7 +540,7 @@
+ 
+   if (self->rem_received_len >= self->rem_expect_len)
+     {
+-      fpc_process_data (self, "trailing");
++      fpc_process_data (self, "trailing", TRUE);
+       self->rem_expect_len = 0;
+       self->rem_received_len = 0;
+     }
+@@ -722,7 +727,7 @@
+           fp_dbg ("%s: header-only record, evtid %u -- processed, reading on",
+                   G_STRFUNC, evt_id);
+           fpc_tls_buff_clear ();
+-          fpc_process_data (self, "dead pixel header-only");
++          fpc_process_data (self, "dead pixel header-only", TRUE);
+           fpi_ssm_jump_to_state (transfer->ssm, fpi_ssm_get_cur_state (transfer->ssm));
+           return;
+         }
+@@ -760,7 +765,7 @@
+     {
+       received_len = 0;
+       expect_len = 0;
+-      fpc_process_data (self, "dead pixel");
++      fpc_process_data (self, "dead pixel", FALSE);
+ 
+       gboolean done;
+ 
+@@ -983,7 +988,7 @@
+     {
+       received_len = 0;
+       expect_len = 0;
+-      fpc_process_data (self, "image");
++      fpc_process_data (self, "image", FALSE);
+       fpi_ssm_next_state (transfer->ssm);
+     }
+   else

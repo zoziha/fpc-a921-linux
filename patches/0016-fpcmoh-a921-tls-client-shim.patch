@@ -1,0 +1,174 @@
+fpcmoh: drive the a921 TLS handshake with an LD_PRELOADed client shim
+
+After 0x05 the a921 never starts the handshake: it is a TLS *server*, and it
+only answers once the host has sent a ClientHello. Verified on the hardware
+with a usb relay: after TLS_INIT nothing appears on EP 0x81 for seconds, but
+a ClientHello written with 0x06 is answered immediately with ServerHello /
+ServerHelloDone, and the full PSK (cipher 0x00a8, PSK-AES128-GCM-SHA256,
+identity "Disum PSK") exchange follows.
+
+The host side cannot produce that ClientHello either. libfpcbep.so's bundled
+mbedtls is built server-only: mbedtls_ssl_handshake_step tests
+MBEDTLS_SSL_IS_SERVER in the config and otherwise returns
+MBEDTLS_ERR_SSL_BAD_INPUT_DATA; there is no client handshake code in the
+blob, and flipping the endpoint of its global ssl context changes nothing
+(no record is written). The blob was built for the a900, whose sensor is the
+TLS client.
+
+So the client half comes from libfpc_tlsclient.so (tools/fpc_tlsclient.c,
+installed next to the blob and LD_PRELOADed into fprintd). It interposes the
+blob's mbedtls_ssl_handshake_step / _read / _write / _get_bytes_avail for the
+blob's global ssl context (base+0x1960f8, pinned and verified against
+fpc_enclave_init), runs an OpenSSL TLS 1.2 PSK client over the same
+fpc_tls_buff / fpc_tls_write_buff rings, sends records through the blob's own
+fpc_tls_send_usb_data() (size_t + <=64-byte chunks, what the WRITE state
+expects), and sets the blob's TLS state word (base+0x196100) to 16
+(MBEDTLS_SSL_HANDSHAKE_OVER) once OpenSSL reports success. 16 is exactly what
+fpc_enclave_get_tls_status() maps to "complete" and what
+fpc_enclave_process_data() and the image relayout path gate on.
+
+Driver changes: start the shim with the PSK the package generator placed at
+0x200 as soon as fpc_connect_tls() has created the rings; after 0x05 go
+straight to the handshake instead of first waiting for a sensor hello; while
+the shim has nothing to write, read EP 0x81 instead of spinning in the
+PROCESS state; stop the shim on close.
+
+Hardware result: handshake completes in five records (client hello 114 B,
+server 102 B + 21 B, client key exchange 71 B, server CCS+Finished 18 B +
+57 B); fpc_enclave_get_tls_status() returns 1. The a900 path is untouched.
+
+--- a/libfprint/drivers/fpcmoh/fpc.c
++++ b/libfprint/drivers/fpcmoh/fpc.c
+@@ -133,6 +133,38 @@
+   return base;
+ }
+ 
++/* patches/0016: libfpcbep.so's mbedtls is built server-only and the a921 is a
++ * TLS server as well, so the blob can never drive the handshake (it returns
++ * MBEDTLS_ERR_SSL_BAD_INPUT_DATA for any client config). libfpc_tlsclient.so,
++ * LD_PRELOADed into fprintd, interposes the blob's mbedtls_ssl_* calls for
++ * its global ssl context and runs an OpenSSL TLS 1.2 PSK client over the same
++ * fpc_tls_buff/fpc_tls_write_buff rings. These are its two entry points. */
++typedef int (*FpcA921TlsStart) (const guint8 *key, guint32 key_len);
++typedef void (*FpcA921TlsStop) (void);
++
++static FpcA921TlsStart fpc_a921_tls_start;
++static FpcA921TlsStop fpc_a921_tls_stop;
++
++static gboolean
++fpc_a921_tlsclient_load (void)
++{
++  static gboolean tried = FALSE;
++
++  if (!tried)
++    {
++      tried = TRUE;
++      fpc_a921_tls_start = (FpcA921TlsStart) dlsym (RTLD_DEFAULT,
++                                                    "fpc_a921_tlsclient_start");
++      fpc_a921_tls_stop = (FpcA921TlsStop) dlsym (RTLD_DEFAULT,
++                                                  "fpc_a921_tlsclient_stop");
++      if (!fpc_a921_tls_start || !fpc_a921_tls_stop)
++        fp_warn ("%s: libfpc_tlsclient.so is not preloaded; the a921 TLS "
++                 "handshake cannot complete", G_STRFUNC);
++    }
++
++  return fpc_a921_tls_start && fpc_a921_tls_stop;
++}
++
+ /*
+  * Insert FPC_IMG_MSG_GAP bytes between the metadata and the pixels of the image
+  * message the enclave is currently assembling. Call immediately after the
+@@ -2353,6 +2385,24 @@
+   fp_dbg ("%s exit <--", G_STRFUNC);
+ }
+ 
++/* patches/0016: the a900 firmware pushes its own hello after 0x05, which is
++ * why the generic SSM enters WAIT4HELLO next. The a921 is a plain TLS server:
++ * nothing appears on EP 0x81 until the client sends its ClientHello, so
++ * waiting first deadlocks init (verified on hardware: 0x05, then 1.5 s of
++ * reads return nothing; 0x06 with the ClientHello is answered at once). */
++static void
++fpc_a921_tls_init_cb (FpiUsbTransfer *transfer, FpDevice *device,
++                      gpointer user_data, GError *error)
++{
++  if (error)
++    {
++      fpi_ssm_mark_failed (transfer->ssm, error);
++      return;
++    }
++
++  fpi_ssm_jump_to_state (transfer->ssm, FPC_INIT_TLS_HANDSHAKE_PROCESS);
++}
++
+ static void
+ fpc_init_sm_run_state (FpiSsm *ssm, FpDevice *device)
+ {
+@@ -2386,14 +2436,43 @@
+ 
+     case FPC_INIT_TLS_CONNECT:
+       {
+-        fpc_connect_tls (device, self->dev_ctx);
++        if (FPC_A921_HWID == self->dev_ctx->hwid)
++          {
++            /* patches/0016: the rings and the blob's PSK must exist before
++             * the shim replaces its (server-only) handshake. */
++            int ret = fpc_connect_tls (device, self->dev_ctx);
++
++            if (ret ||
++                !self->dev_ctx->a921_pkg ||
++                !fpc_a921_tlsclient_load () ||
++                fpc_a921_tls_start (self->dev_ctx->a921_pkg + FPC_A921_KEY_OFF,
++                                    32))
++              {
++                fp_err ("%s: cannot start the a921 TLS client (ret %d)",
++                        G_STRFUNC, ret);
++                fpi_ssm_mark_failed (ssm,
++                                     fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
++                break;
++              }
++          }
++        else
++          {
++            fpc_connect_tls (device, self->dev_ctx);
++          }
+         fpi_ssm_next_state (ssm);
+       }
+       break;
+ 
+     case FPC_INIT_TLS_HANDSHAKE_START:
+       {
+-        fpc_write_ctrl (ssm, device, 0x05, 0x01, NULL, 0, fpi_ssm_usb_transfer_cb, NULL);
++        /* patches/0016: a921 answers only after the ClientHello (see
++         * fpc_a921_tls_init_cb); a900 still goes through WAIT4HELLO. */
++        if (self->dev_ctx->hwid == FPC_A921_HWID)
++          fpc_write_ctrl (ssm, device, 0x05, 0x01, NULL, 0,
++                          fpc_a921_tls_init_cb, NULL);
++        else
++          fpc_write_ctrl (ssm, device, 0x05, 0x01, NULL, 0,
++                          fpi_ssm_usb_transfer_cb, NULL);
+       }
+       break;
+ 
+@@ -2414,6 +2493,11 @@
+           fpi_ssm_next_state (ssm);
+         else if (8 == self->dev_ctx->tls_status || 10 == self->dev_ctx->tls_status || 11 == self->dev_ctx->tls_status)
+           fpi_ssm_jump_to_state (ssm, FPC_INIT_TLS_HANDSHAKE_WAIT4HELLO);
++        else if (FPC_A921_HWID == self->dev_ctx->hwid)
++          /* patches/0016: the a921 is the TLS server; while the shim has
++           * nothing to write it is waiting for the next record, so read
++           * EP 0x81 instead of spinning here. */
++          fpi_ssm_jump_to_state (ssm, FPC_INIT_TLS_HANDSHAKE_WAIT4HELLO);
+         else
+           fpi_ssm_jump_to_state (ssm, FPC_INIT_TLS_HANDSHAKE_PROCESS);
+       }
+@@ -2654,6 +2738,10 @@
+ 
+   fp_dbg ("%s enter -->", G_STRFUNC);
+ 
++  /* patches/0016: drop the shim's SSL session before the rings go away. */
++  if (FPC_A921_HWID == self->dev_ctx->hwid && fpc_a921_tls_stop)
++    fpc_a921_tls_stop ();
++
+   fpc_tls_write_buff_release ();
+   fpc_tls_buff_release ();
+   g_clear_pointer (&self->dev_ctx->tls_data, g_free);

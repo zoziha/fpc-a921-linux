@@ -1,0 +1,37 @@
+Subject: [PATCH] fpcmoh: drain the a921's twelfth capture record
+
+The a921 sends one more record per capture than the eleven fixed read
+states consume. That record carries the last 24 bytes of the image
+message (the message is 11288 = 11 * 1024 + 24), so without draining it
+the enclave is handed 11264 bytes, fpc_enclave_process_data() returns -6
+on every record, and the stray record is then eaten by the dead-pixel
+read, which desynchronises the TLS stream (`ssl error 1`).
+
+Enable the same read-remaining drain the a900 uses. FP_ENROLL_X_POSTDRAIN
+then reads the trailing record, feeds it to the TLS ring and calls
+fpc_enclave_process_data(), completing the message.
+
+---
+ libfprint/drivers/fpcmoh/fpc.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/libfprint/drivers/fpcmoh/fpc.c b/libfprint/drivers/fpcmoh/fpc.c
+--- a/libfprint/drivers/fpcmoh/fpc.c
++++ b/libfprint/drivers/fpcmoh/fpc.c
+@@ -2206,8 +2206,14 @@
+     {
+     case 0x9800:
+-    case 0xA921:
+       self->max_enroll_stage = MAX_ENROLL_SAMPLES;
+       break;
+ 
++    case 0xA921:
++      self->max_enroll_stage = MAX_ENROLL_SAMPLES;
++      /* patches/0017: one more record per capture than the eleven fixed
++       * read states consume; it carries the last 24 bytes of the image. */
++      self->read_remaining = TRUE;
++      break;
++
+     case 0xA900:
+       /* patches/0010: this sensor's matcher wants sixteen samples. */
+       self->max_enroll_stage = MAX_ENROLL_SAMPLES_A900;

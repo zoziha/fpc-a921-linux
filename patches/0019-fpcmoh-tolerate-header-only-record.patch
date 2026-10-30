@@ -1,0 +1,46 @@
+Subject: [PATCH] fpcmoh: tolerate a header-only record before the dead-pixel answer
+
+A capture can end with a header-only record (evtid 6, length 12) that arrives
+after the post-drain read has already timed out. It lands in
+fpc_read_dead_pixels() ahead of the real answer, which used to trip the
+"len ... err!" path, fail the SSM and abort the whole operation.
+
+Hand such a record to the enclave before failing: clearing the ring and calling
+fpc_enclave_process_data() keeps the TLS sequence aligned, and the read is then
+repeated for the actual answer. The failure message now also names the event
+id and length, which is what distinguished this case from a genuine truncation.
+
+---
+libfprint/drivers/fpcmoh/fpc.c |   21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+--- a/libfprint/drivers/fpcmoh/fpc.c
++++ b/libfprint/drivers/fpcmoh/fpc.c
+@@ -697,7 +697,26 @@
+     }
+   if (transfer->actual_length <= sizeof (evt_hdr_t) && expect_len == 0)
+     {
+-      fp_err ("%s: len %lu err!", G_STRFUNC, transfer->actual_length);
++      evt_hdr_t *evt = (evt_hdr_t *) transfer->buffer;
++      guint32 evt_id = transfer->actual_length >= sizeof (evt_hdr_t) ? fpc32 (evt->cmdid) : 0;
++      guint32 evt_len = transfer->actual_length >= sizeof (evt_hdr_t) ? fpc32 (evt->length) : 0;
++
++      /* A capture can end with a header-only record (evtid 6, length 12) that
++       * arrives after the post-drain read has already timed out; it then lands
++       * here, ahead of the real dead-pixel answer. Hand it to the enclave so the
++       * TLS sequence stays aligned and read again. */
++      if (transfer->actual_length == sizeof (evt_hdr_t) && evt_len == sizeof (evt_hdr_t))
++        {
++          fp_dbg ("%s: header-only record, evtid %u -- processed, reading on",
++                  G_STRFUNC, evt_id);
++          fpc_tls_buff_clear ();
++          fpc_process_data (self, "dead pixel header-only");
++          fpi_ssm_jump_to_state (transfer->ssm, fpi_ssm_get_cur_state (transfer->ssm));
++          return;
++        }
++
++      fp_err ("%s: len %" G_GSIZE_FORMAT " evtid %u evtlen %u err!", G_STRFUNC,
++              transfer->actual_length, evt_id, evt_len);
+       fpi_ssm_mark_failed (transfer->ssm,
+                            fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
+       return;

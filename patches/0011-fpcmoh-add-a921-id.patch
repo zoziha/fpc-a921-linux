@@ -1,0 +1,21 @@
+Subject: [PATCH] fpcmoh: add support for FPC 10a5:a921
+
+---
+ libfprint/drivers/fpcmoh/fpc.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/libfprint/drivers/fpcmoh/fpc.c b/libfprint/drivers/fpcmoh/fpc.c
+--- a/libfprint/drivers/fpcmoh/fpc.c
++++ b/libfprint/drivers/fpcmoh/fpc.c
+@@ -203,5 +203,6 @@
+ static const FpIdEntry id_table[] = {
+   { .vid = 0x10A5,  .pid = 0x9800,  },
+   { .vid = 0x10A5,  .pid = 0xA900,  },   /* Honor MagicBook, FPC "Disum", FW 22.26.2.29 */
++  { .vid = 0x10A5,  .pid = 0xA921,  },   /* Honor, FPC Sensor Controller (experimental) */
+   { .vid = 0,  .pid = 0,  .driver_data = 0 },   /* terminating entry */
+ };
+@@ -2206,3 +2207,4 @@
+     case 0x9800:
++    case 0xA921:
+       self->max_enroll_stage = MAX_ENROLL_SAMPLES;
+       break;

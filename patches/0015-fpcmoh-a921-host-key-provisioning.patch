@@ -1,0 +1,457 @@
+fpcmoh: provision the a921's TLS key from the host before the handshake
+
+CMD_GET_TLS_KEY (0x0b) stalls on 10a5:a921 until a key has been installed with
+CMD_SET_TLS_KEY (0x0d). The a900 firmware ships with its sealed PSK already in
+flash, which is why reading it straight away worked there and times out here.
+
+The Windows stack does, on every init:
+
+    enclave: get_enckey_size / pack   -> one 2048-byte package
+    CMD_SET_TLS_KEY  (0x0d) with that package
+    CMD_GET_TLS_KEY  (0x0b), compare size and bytes
+    enclave: handle_tls_connection(sealed packet inside the package)
+
+Two different sealing schemes are involved. fpc_enclave_gen_sealed_tls_key()
+fills the package with the PSK in the clear at 0x200 and a 105-byte sealed
+packet at 0x400, but seals that packet with a 12-byte AAD while
+fpc_enclave_handle_tls_connection() insists on 13 bytes (NUL included) and
+returns -16 otherwise. The packet is therefore regenerated for the enclave
+with fpc_wrap_crypto_aad() and the 13-byte AAD.
+
+The sensor firmware accepts neither the 2048-byte package nor that 105-byte
+packet. It speaks the Windows scheme: a 119-byte packet, magic 0x0dec0ded,
+k1 = SHA256("FPC_SEALING_KEY\0"), mat[64] = HMAC-SHA256(k1, BE32(i) ||
+"application keys\0" || BE32(512)) for i = 1, 2, AES-256-CBC with key
+mat[32:64] and IV = HMAC-SHA256(mat[0:32], "iv\0" || BE32(0x2020f00d))[:16],
+tag = HMAC-SHA256(mat[0:32], "FPC_HMAC_KEY\0" || ct[32] || "FPC_KEY_AAD"[11]).
+Its header fields are little-endian, like the rest of the a921 protocol.
+Verified on the hardware: the sensor echoes all 119 bytes back unchanged.
+
+The driver therefore takes the PSK the package generator placed at 0x200,
+seals it the Windows way for the sensor, and keeps the enclave's own packet
+for the same PSK. CMD_SET_TLS_KEY/CMD_GET_TLS_KEY carry 119 bytes; after
+0x05 TLS_INIT both sides share one key.
+
+Only 0x0d and 0x0b are used; 0x10 FUSE_DEVICE and 0x32 FLUSH_KEYS never are.
+
+--- a/libfprint/drivers/fpcmoh/fpc.c
++++ b/libfprint/drivers/fpcmoh/fpc.c
+@@ -1823,6 +1823,317 @@
+                            NULL);
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * patches/0015: TLS key provisioning for FPC 10a5:a921.
++ *
++ * The a900 stores its sealed PSK in the sensor (CMD_GET_TLS_KEY alone returns
++ * it). The a921 does not: CMD_GET_TLS_KEY stalls until the host has installed
++ * a key with CMD_SET_TLS_KEY (0x0d), and the Windows stack does exactly that
++ * on every init --
++ *
++ *   enclave: get_enckey_size / pack   (one 2048-byte "package")
++ *   CMD_SET_TLS_KEY   (0x0d) with that package
++ *   CMD_GET_TLS_KEY   (0x0b) read it back, compare size + bytes with memcmp
++ *   enclave: handle_tls_connection(sealed packet)
++ *
++ * Two different sealing schemes are involved, and they are NOT the same:
++ *
++ *  - fpc_enclave_gen_sealed_tls_key() fills a 2048-byte container
++ *      [0]=0xf00dface [4]=1 [8]=32 (key_len) [0xc]=0x200 (key_off)
++ *      PSK in the clear at 0x200, [0x10]=sealed_len [0x14]=0x400 (sd_off)
++ *      a 105-byte blob-sealed packet at 0x400
++ *    but that packet is sealed with a 12-byte AAD, while
++ *    fpc_enclave_handle_tls_connection() insists on 13 bytes (NUL included).
++ *    It is therefore regenerated here with fpc_wrap_crypto_aad() and the
++ *    13-byte AAD; the enclave accepts it (verified offline: returns 0).
++ *
++ *  - the sensor firmware does NOT accept the blob's 105-byte packet at all.
++ *    It speaks the Windows scheme: a 119-byte packet, magic 0x0dec0ded,
++ *    k1 = SHA256("FPC_SEALING_KEY\0"), mat[64] from HMAC-SHA256(k1, ...),
++ *    AES-256-CBC key mat[32:64], IV = HMAC-SHA256(mat[0:32], "iv\0"+BE32
++ *    (0x2020f00d))[:16], tag = HMAC-SHA256(mat[0:32], "FPC_HMAC_KEY\0" ||
++ *    ct[32] || "FPC_KEY_AAD"[11]). Verified on the hardware: the sensor
++ *    echoes the 119 bytes back byte-for-byte.
++ *
++ * The bridge: pick the PSK the blob's generator placed at key_off, seal that
++ * same PSK the Windows way for the sensor, and hand the blob its own 105-byte
++ * packet for it. After 0x05 TLS_INIT both sides share one key.
++ *
++ * Only 0x0d and 0x0b are used. Nothing destructive: 0x10 FUSE_DEVICE and
++ * 0x32 FLUSH_KEYS are never sent.
++ * ------------------------------------------------------------------------- */
++
++/* mbedtls 2.x AES context, exported by libfpcbep.so (a DT_NEEDED lib). */
++typedef struct
++{
++  int       nr;
++  uint32_t *rk;
++  uint32_t  buf[68];
++} fpc_aes_ctx_t;
++
++extern void mbedtls_aes_init (fpc_aes_ctx_t *ctx);
++extern void mbedtls_aes_free (fpc_aes_ctx_t *ctx);
++extern int  mbedtls_aes_setkey_enc (fpc_aes_ctx_t       *ctx,
++                                    const unsigned char *key,
++                                    unsigned int         keybits);
++extern int  mbedtls_aes_crypt_cbc (fpc_aes_ctx_t       *ctx,
++                                   int                  mode,
++                                   size_t               length,
++                                   unsigned char        iv[16],
++                                   const unsigned char *input,
++                                   unsigned char       *output);
++
++#define FPC_AES_ENCRYPT (1)
++
++static inline void
++fpc_a921_put_be32 (guint8 *p, guint32 v)
++{
++  v = GUINT32_TO_BE (v);
++  memcpy (p, &v, sizeof (v));
++}
++
++/* The sensor's vendor protocol stores multi-byte fields little-endian (see
++ * patches/0012), and its sealed-key header follows suit: the accepted
++ * reference packet has 0x0dec0ded at offset 0 as ed 0d ec 0d. */
++static inline void
++fpc_a921_put_le32 (guint8 *p, guint32 v)
++{
++  v = GUINT32_TO_LE (v);
++  memcpy (p, &v, sizeof (v));
++}
++
++static gboolean
++fpc_a921_seal_psk (const guint8 psk[32], guint8 out[FPC_A921_PKT_SIZE])
++{
++  static const char seal_label[] = "FPC_SEALING_KEY";  /* 16 bytes with NUL */
++  static const char kdf_label[]  = "application keys"; /* 17 bytes with NUL */
++  static const char hmac_label[] = "FPC_HMAC_KEY";     /* 13 bytes with NUL */
++  static const char iv_label[]   = "iv";               /* 3 bytes with NUL */
++  guint8 k1[32], mat[64], aes_key[32];
++  guint8 iv_msg[sizeof (iv_label) + 4];
++  guint8 iv[32];
++  guint8 msg[4 + sizeof (kdf_label) + 4];
++  guint8 tag_msg[sizeof (hmac_label) + 32 + FPC_A921_KEY_AAD_LEN];
++  fpc_aes_ctx_t aes;
++  int ret;
++
++  ret = fpc_sha256_message ((const guint8 *) seal_label, sizeof (seal_label), k1);
++  if (ret)
++    {
++      fp_err ("%s: sha256(seal label) failed: %d", G_STRFUNC, ret);
++      return FALSE;
++    }
++
++  for (ret = 1; ret <= 2; ret++)
++    {
++      fpc_a921_put_be32 (msg, ret);
++      memcpy (msg + 4, kdf_label, sizeof (kdf_label));
++      fpc_a921_put_be32 (msg + 4 + sizeof (kdf_label), 512);
++      if (fpc_hmac_sha256 (msg, sizeof (msg), k1, sizeof (k1),
++                           mat + (ret - 1) * 32))
++        {
++          fp_err ("%s: kdf block %d failed", G_STRFUNC, ret);
++          return FALSE;
++        }
++    }
++
++  memcpy (iv_msg, iv_label, sizeof (iv_label));
++  fpc_a921_put_be32 (iv_msg + sizeof (iv_label), FPC_A921_IV_SEED);
++  if (fpc_hmac_sha256 (iv_msg, sizeof (iv_msg), mat, 32, iv))
++    {
++      fp_err ("%s: iv derivation failed", G_STRFUNC);
++      return FALSE;
++    }
++
++  memset (out, 0, FPC_A921_PKT_SIZE);
++  fpc_a921_put_le32 (out + 0x00, FPC_A921_PKT_MAGIC);
++  fpc_a921_put_le32 (out + 0x04, 0x1c); /* ct offset */
++  fpc_a921_put_le32 (out + 0x08, 32);   /* key length */
++  fpc_a921_put_le32 (out + 0x0c, 0x4c); /* aad offset */
++  fpc_a921_put_le32 (out + 0x10, FPC_A921_KEY_AAD_LEN);
++  fpc_a921_put_le32 (out + 0x14, 0x57); /* tag offset */
++  fpc_a921_put_le32 (out + 0x18, 32);   /* tag length */
++  memcpy (out + 0x4c, FPC_A921_KEY_AAD, FPC_A921_KEY_AAD_LEN);
++
++  memcpy (aes_key, mat + 32, sizeof (aes_key));
++  mbedtls_aes_init (&aes);
++  ret = mbedtls_aes_setkey_enc (&aes, aes_key, 256);
++  if (!ret)
++    ret = mbedtls_aes_crypt_cbc (&aes, FPC_AES_ENCRYPT, 32, iv, psk,
++                                 out + 0x1c);
++  mbedtls_aes_free (&aes);
++  if (ret)
++    {
++      fp_err ("%s: aes-256-cbc failed: %d", G_STRFUNC, ret);
++      return FALSE;
++    }
++
++  memcpy (tag_msg, hmac_label, sizeof (hmac_label));
++  memcpy (tag_msg + sizeof (hmac_label), out + 0x1c, 32);
++  memcpy (tag_msg + sizeof (hmac_label) + 32, out + 0x4c,
++          FPC_A921_KEY_AAD_LEN);
++  if (fpc_hmac_sha256 (tag_msg, sizeof (tag_msg), mat, 32, out + 0x57))
++    {
++      fp_err ("%s: tag failed", G_STRFUNC);
++      return FALSE;
++    }
++
++  return TRUE;
++}
++
++static gboolean
++fpc_a921_build_pkg (PDEVICE_CONTEXT ctx)
++{
++  static const guint8 aad[sizeof (FPC_A921_AAD)] = FPC_A921_AAD;
++  guint32 sealed_len;
++  guint32 *hdr;
++  int ret;
++
++  if (!ctx->a921_pkg)
++    ctx->a921_pkg = g_malloc0 (FPC_A921_PKG_SIZE);
++  if (!ctx->a921_pkt)
++    ctx->a921_pkt = g_malloc0 (FPC_A921_PKT_SIZE);
++  if (!ctx->a921_pkg || !ctx->a921_pkt)
++    return FALSE;
++
++  ret = fpc_enclave_gen_sealed_tls_key (ctx->enclave, ctx->a921_pkg,
++                                        FPC_A921_PKG_SIZE);
++  if (ret)
++    {
++      fp_err ("%s: gen_sealed_tls_key failed: %d", G_STRFUNC, ret);
++      return FALSE;
++    }
++
++  hdr = (guint32 *) ctx->a921_pkg;
++  if (hdr[0] != FPC_A921_PKG_MAGIC ||
++      hdr[2] != 32 ||
++      hdr[3] != FPC_A921_KEY_OFF ||
++      hdr[5] != FPC_A921_SD_OFF ||
++      hdr[3] + hdr[2] > FPC_A921_PKG_SIZE ||
++      hdr[5] + hdr[4] > FPC_A921_PKG_SIZE)
++    {
++      fp_err ("%s: unexpected package layout (magic %#x fmt %u)",
++              G_STRFUNC, hdr[0], hdr[1]);
++      return FALSE;
++    }
++
++  /* sensor side: the Windows 119-byte packet carrying this same PSK */
++  if (!fpc_a921_seal_psk (ctx->a921_pkg + hdr[3], ctx->a921_pkt))
++    return FALSE;
++
++  /* enclave side: its own 105-byte packet, 13-byte AAD (see the note above) */
++  sealed_len = ctx->tls_data_len;
++  ret = fpc_wrap_crypto_aad (ctx->a921_pkg + hdr[3], hdr[2],
++                             (guint8 *) aad, sizeof (aad),
++                             ctx->tls_data, &sealed_len);
++  if (ret)
++    {
++      fp_err ("%s: wrap_crypto_aad failed: %d", G_STRFUNC, ret);
++      return FALSE;
++    }
++  ctx->tls_data_len = sealed_len;
++
++  fp_dbg ("%s: ready, sensor packet %u bytes, envoy packet %u bytes",
++          G_STRFUNC, FPC_A921_PKT_SIZE, sealed_len);
++  return TRUE;
++}
++
++static void
++fpc_a921_get_cb (FpiUsbTransfer *transfer, FpDevice *device,
++                 gpointer user_data, GError *error)
++{
++  FpiDeviceFpcMoh *self = FPI_DEVICE_FPCMOH (device);
++  PDEVICE_CONTEXT ctx = self->dev_ctx;
++
++  fp_dbg ("enter %s", G_STRFUNC);
++
++  if (error)
++    {
++      fp_err ("%s: %s", G_STRFUNC, error->message);
++      fpi_ssm_mark_failed (transfer->ssm, error);
++      return;
++    }
++
++  if (transfer->actual_length != FPC_A921_PKT_SIZE ||
++      memcmp (transfer->buffer, ctx->a921_pkt, FPC_A921_PKT_SIZE) != 0)
++    {
++      fp_err ("%s: read-back %lu bytes, packet mismatch",
++              G_STRFUNC, (gsize) transfer->actual_length);
++      fpi_ssm_mark_failed (transfer->ssm,
++                           fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
++      return;
++    }
++
++  fp_dbg ("%s: sensor accepted the %u-byte key packet",
++          G_STRFUNC, FPC_A921_PKT_SIZE);
++
++  fpi_ssm_next_state (transfer->ssm);
++}
++
++static void
++fpc_a921_set_cb (FpiUsbTransfer *transfer, FpDevice *device,
++                 gpointer user_data, GError *error)
++{
++  FpiUsbTransfer *get;
++
++  fp_dbg ("enter %s", G_STRFUNC);
++
++  if (error)
++    {
++      fp_err ("%s: SET_TLS_KEY failed: %s", G_STRFUNC, error->message);
++      fpi_ssm_mark_failed (transfer->ssm, error);
++      return;
++    }
++
++  get = fpi_usb_transfer_new (device);
++  fpi_usb_transfer_fill_control (get,
++                                 G_USB_DEVICE_DIRECTION_DEVICE_TO_HOST,
++                                 G_USB_DEVICE_REQUEST_TYPE_VENDOR,
++                                 G_USB_DEVICE_RECIPIENT_DEVICE,
++                                 0x0b,
++                                 0,
++                                 0x00,
++                                 FPC_A921_PKT_SIZE);
++  get->ssm = transfer->ssm;
++  get->short_is_error = TRUE;
++  fpi_usb_transfer_submit (get,
++                           DATA_TIMEOUT,
++                           NULL,
++                           fpc_a921_get_cb,
++                           NULL);
++}
++
++static void
++fpc_a921_provision (FpiSsm *ssm, FpDevice *dev)
++{
++  FpiDeviceFpcMoh *self = FPI_DEVICE_FPCMOH (dev);
++  FpiUsbTransfer *transfer;
++
++  if (!fpc_a921_build_pkg (self->dev_ctx))
++    {
++      fpi_ssm_mark_failed (ssm,
++                           fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
++      return;
++    }
++
++  transfer = fpi_usb_transfer_new (dev);
++  fpi_usb_transfer_fill_control (transfer,
++                                 G_USB_DEVICE_DIRECTION_HOST_TO_DEVICE,
++                                 G_USB_DEVICE_REQUEST_TYPE_VENDOR,
++                                 G_USB_DEVICE_RECIPIENT_DEVICE,
++                                 0x0d,
++                                 0,
++                                 0x00,
++                                 FPC_A921_PKT_SIZE);
++  memcpy (transfer->buffer, self->dev_ctx->a921_pkt, FPC_A921_PKT_SIZE);
++  transfer->ssm = ssm;
++  fpi_usb_transfer_submit (transfer,
++                           DATA_TIMEOUT,
++                           NULL,
++                           fpc_a921_set_cb,
++                           NULL);
++}
++
+ 
+ static int
+ fpc_init_evt_handler (FpDevice *device, uint8_t *data, uint32_t len)
+@@ -1853,6 +2164,8 @@
+ 
+   uint16_t hwid = fpc16 (ini->hw_id);
+ 
++  pDevCtx->hwid = hwid;
++
+   if (hwid)
+     {
+       if (pDevCtx->initialized == FALSE)
+@@ -2063,7 +2376,12 @@
+       break;
+ 
+     case FPC_INIT_INIT:
+-      fpc_read_0b (ssm, device);
++      /* patches/0015: the a921 has no key of its own until the host installs
++       * one; the a900 path reads it with 0x0b straight away. */
++      if (self->dev_ctx->hwid == FPC_A921_HWID)
++        fpc_a921_provision (ssm, device);
++      else
++        fpc_read_0b (ssm, device);
+       break;
+ 
+     case FPC_INIT_TLS_CONNECT:
+@@ -2339,6 +2657,8 @@
+   fpc_tls_write_buff_release ();
+   fpc_tls_buff_release ();
+   g_clear_pointer (&self->dev_ctx->tls_data, g_free);
++  g_clear_pointer (&self->dev_ctx->a921_pkg, g_free);
++  g_clear_pointer (&self->dev_ctx->a921_pkt, g_free);
+ 
+   fpc_destroy_enclave (self->dev_ctx->enclave);
+ 
+--- a/libfprint/drivers/fpcmoh/fpc.h
++++ b/libfprint/drivers/fpcmoh/fpc.h
+@@ -67,6 +67,22 @@
+ #define FPC_HOST_MS_S0 (0x10)
+ #define FPC_HOST_MS_SX (0x11)
+ 
++/* patches/0015: 10a5:a921 provisions its TLS key from the host. */
++#define FPC_A921_HWID (0x0331)
++#define FPC_A921_PKG_SIZE (2048)
++#define FPC_A921_PKG_MAGIC (0xf00dface)
++#define FPC_A921_KEY_OFF (0x200)
++#define FPC_A921_SD_OFF (0x400)
++#define FPC_A921_AAD "FPC TLS Keys"
++/* The sensor's firmware does not accept the blob's 105-byte sealed packet;
++ * it expects the Windows stack's 119-byte one (magic 0x0dec0ded, AAD
++ * "FPC_KEY_AAD", IV seed 0x2020f00d). Both wrap the same 32-byte PSK. */
++#define FPC_A921_PKT_SIZE (119)
++#define FPC_A921_PKT_MAGIC (0x0dec0ded)
++#define FPC_A921_KEY_AAD "FPC_KEY_AAD"
++#define FPC_A921_KEY_AAD_LEN (11)
++#define FPC_A921_IV_SEED (0x2020f00d)
++
+ #define FP_COMPONENT "fpcmoh"
+ #define MAX_ENROLL_SAMPLES (11)
+ 
+@@ -314,8 +330,12 @@
+   struct fpc_tee_bio *bio;
+   guint32             img_w;
+   guint32             img_h;
++  guint16             hwid;
+   guint8             *tls_data;
+   guint32             tls_data_len;
++  /* patches/0015: 10a5:a921 needs host-side key provisioning before TLS. */
++  guint8             *a921_pkg;
++  guint8             *a921_pkt;
+   guint32             yasc_session_id;
+   fpc_enclave_t      *enclave;
+   fpc_tls_status_t    tls_status;
+--- a/libfprint/drivers/fpcmoh/fpclib_api.h
++++ b/libfprint/drivers/fpcmoh/fpclib_api.h
+@@ -28,6 +28,28 @@
+ int32_t fpc_enclave_handle_tls_connection (fpc_enclave_t *enclave,
+                                            uint8_t       *sealed_tls_key,
+                                            uint32_t       sealed_tls_key_len);
++/* patches/0015: exported by libfpcbep.so but absent from the original header.
++ * gen_sealed_tls_key fills a 2048-byte container (magic 0xf00dface) holding
++ * the PSK plus a sealed packet; wrap_crypto_aad seals a PSK with an AAD. */
++int32_t fpc_enclave_gen_sealed_tls_key (fpc_enclave_t *enclave,
++                                        uint8_t       *package,
++                                        uint32_t       package_len);
++int     fpc_wrap_crypto_aad (uint8_t  *key,
++                             uint32_t  key_len,
++                             uint8_t  *aad,
++                             uint32_t  aad_len,
++                             uint8_t  *out,
++                             uint32_t *out_len);
++/* patches/0015: raw primitives used to build the sensor's 119-byte sealed
++ * packet (the Windows scheme, which differs from the blob's own). */
++int32_t fpc_sha256_message (const uint8_t *data,
++                            uint32_t       data_len,
++                            uint8_t       *hash);
++int32_t fpc_hmac_sha256 (const uint8_t *data,
++                         uint32_t       data_len,
++                         const uint8_t *key,
++                         uint32_t       key_len,
++                         uint8_t       *mac);
+ int32_t fpc_enclave_tls_init_handshake (fpc_enclave_t *enclave);
+ int32_t fpc_enclave_get_tls_status (fpc_enclave_t    *enclave,
+                                     fpc_tls_status_t *status);

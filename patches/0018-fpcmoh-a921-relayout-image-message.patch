@@ -1,0 +1,25 @@
+Subject: [PATCH] fpcmoh: relayout the a921 image message for the matcher
+
+The a921 image message carries the same 24 byte prefix as the a900 but only
+11264 bytes of pixels, while the matcher indexes pixels from offset 34. Without
+the gap every sample is scored as unusable and enrollment never progresses.
+
+Enable relayout_img_msg for the a921, which opens the 10 byte gap at offset 24
+that fpc_img_msg_relayout() has always applied to the a900.
+
+---
+libfprint/drivers/fpcmoh/fpc.c |    3 +++
+ 1 file changed, 3 insertions(+)
+
+--- a/libfprint/drivers/fpcmoh/fpc.c
++++ b/libfprint/drivers/fpcmoh/fpc.c
+@@ -2637,6 +2637,9 @@
+       /* patches/0017: one more record per capture than the eleven fixed
+        * read states consume; it carries the last 24 bytes of the image. */
+       self->read_remaining = TRUE;
++      /* patches/0018: same 24 byte image message prefix as the a900, while the
++       * matcher wants 34. Without the gap every sample is rejected. */
++      self->relayout_img_msg = TRUE;
+       break;
+ 
+     case 0xA900:

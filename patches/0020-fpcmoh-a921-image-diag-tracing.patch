@@ -1,0 +1,37 @@
+Subject: [PATCH] fpcmoh: add FPC_IMG_DIAG tracing to the image message relayout
+
+fpc_img_msg_relayout() silently returns whenever the blob's message state is
+not the one it expects, which made a non-applied gap indistinguishable from a
+gap that was applied too early or too late.
+
+With FPC_IMG_DIAG=1 in the environment, log the state word, destination pointer,
+received length and total at every call. Used while bringing up the a921; costs
+nothing when the variable is unset.
+
+---
+libfprint/drivers/fpcmoh/fpc.c |   14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+--- a/libfprint/drivers/fpcmoh/fpc.c
++++ b/libfprint/drivers/fpcmoh/fpc.c
+@@ -188,7 +188,19 @@
+ 
+   /* Not a message the blob is assembling into the image buffer. */
+   if (state != 16 || *(guint8 **) (base + FPCBEP_OFF_DSTPTR) != msgbuf)
+-    return;
++    {
++      if (self->relayout_img_msg && g_getenv ("FPC_IMG_DIAG"))
++        fp_warn ("IMG-DIAG: state %u dstptr %s msgbuf (recv_len %u total %u)",
++                 state,
++                 *(guint8 **) (base + FPCBEP_OFF_DSTPTR) == msgbuf ? "==" : "!=",
++                 recv_len, total);
++      return;
++    }
++
++  if (self->relayout_img_msg && g_getenv ("FPC_IMG_DIAG"))
++    fp_warn ("IMG-DIAG: state %u recv_len %u total %u want %u",
++             state, recv_len, total,
++             self->dev_ctx->img_w * self->dev_ctx->img_h);
+ 
+   /* Nothing pending, or the message was already complete and dispatched inside
+    * the call -- too late to help, and nothing here would be safe to touch. */

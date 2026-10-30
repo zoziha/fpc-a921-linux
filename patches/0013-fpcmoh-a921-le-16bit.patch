@@ -1,0 +1,31 @@
+--- a/libfprint/drivers/fpcmoh/fpc.c
++++ b/libfprint/drivers/fpcmoh/fpc.c
+@@ -29,7 +29,13 @@
+ static inline guint32
+ fpc32 (guint32 v)
+ {
+-  return fpc_le_fields ? GUINT32_FROM_LE (v) : fpc32 (v);
++  return fpc_le_fields ? GUINT32_FROM_LE (v) : GUINT32_FROM_BE (v);
++}
++
++static inline guint16
++fpc16 (guint16 v)
++{
++  return fpc_le_fields ? GUINT16_FROM_LE (v) : GUINT16_FROM_BE (v);
+ }
+ 
+ G_DEFINE_TYPE (FpiDeviceFpcMoh, fpi_device_fpcmoh, FP_TYPE_DEVICE);
+@@ -1842,10 +1848,10 @@
+ 
+   PDEVICE_CONTEXT pDevCtx = self->dev_ctx;
+ 
+-  pDevCtx->img_w = GUINT16_FROM_BE (ini->img_w);
+-  pDevCtx->img_h = GUINT16_FROM_BE (ini->img_h);
++  pDevCtx->img_w = fpc16 (ini->img_w);
++  pDevCtx->img_h = fpc16 (ini->img_h);
+ 
+-  uint16_t hwid = GUINT16_FROM_BE (ini->hw_id);
++  uint16_t hwid = fpc16 (ini->hw_id);
+ 
+   if (hwid)
+     {

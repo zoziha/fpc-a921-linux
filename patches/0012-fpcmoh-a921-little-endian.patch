@@ -1,0 +1,91 @@
+--- a/libfprint/drivers/fpcmoh/fpc.c
++++ b/libfprint/drivers/fpcmoh/fpc.c
+@@ -21,6 +21,17 @@
+ #include <byteswap.h>
+ #include <dlfcn.h>
+ 
++/* patches/0012: the 10a5:a921 frames its bulk records little-endian, while the
++ * 9800/a900 use big-endian. Route every on-the-wire 32-bit field through this
++ * so the rest of the driver stays unchanged. */
++static gboolean fpc_le_fields = FALSE;
++
++static inline guint32
++fpc32 (guint32 v)
++{
++  return fpc_le_fields ? GUINT32_FROM_LE (v) : fpc32 (v);
++}
++
+ G_DEFINE_TYPE (FpiDeviceFpcMoh, fpi_device_fpcmoh, FP_TYPE_DEVICE);
+ 
+ /* ---------------------------------------------------------------------------
+@@ -455,11 +466,11 @@
+           return;
+         }
+ 
+-      self->rem_expect_len = GUINT32_FROM_BE (evt->length);
++      self->rem_expect_len = fpc32 (evt->length);
+       self->rem_received_len = transfer->actual_length;
+ 
+       fp_dbg ("%s: trailing record, evtid %u, len %u", G_STRFUNC,
+-              GUINT32_FROM_BE (evt->cmdid), self->rem_expect_len);
++              fpc32 (evt->cmdid), self->rem_expect_len);
+ 
+       fpc_tls_buff_clear ();
+       if (transfer->actual_length > sizeof (evt_hdr_t))
+@@ -665,8 +676,8 @@
+     {
+       //tls header
+       evt_hdr_t *evt = (evt_hdr_t *) transfer->buffer;
+-      guint32 evt_id = GUINT32_FROM_BE (evt->cmdid);
+-      guint32 img_len = GUINT32_FROM_BE (evt->length);
++      guint32 evt_id = fpc32 (evt->cmdid);
++      guint32 img_len = fpc32 (evt->length);
+       fp_dbg ("%s: evtid %u, img_len %u, enroll_cnt %u", G_STRFUNC, evt_id, img_len, self->enroll_count);
+ 
+       fpc_tls_buff_clear ();
+@@ -888,8 +899,8 @@
+       //tls header
+       guint32 seq_1 = *((guint32 *) data);
+       evt_hdr_t *evt = (evt_hdr_t *) transfer->buffer;
+-      guint32 evt_id = GUINT32_FROM_BE (evt->cmdid);
+-      guint32 img_len = GUINT32_FROM_BE (evt->length);
++      guint32 evt_id = fpc32 (evt->cmdid);
++      guint32 img_len = fpc32 (evt->length);
+       fp_dbg ("%s: evtid %u, img_len %u, seq_1 %u", G_STRFUNC, evt_id, img_len, seq_1);
+ 
+       fpc_tls_buff_clear ();
+@@ -1819,7 +1830,7 @@
+       return -1;
+     }
+ 
+-  evt->cmdid = GUINT32_FROM_BE (evt->cmdid);
++  evt->cmdid = fpc32 (evt->cmdid);
+ 
+   if (0x02 != evt->cmdid)
+     {
+@@ -1877,7 +1888,7 @@
+     {
+       evt_hdr_t *evt = (evt_hdr_t *) data;
+ 
+-      evt->cmdid = GUINT32_FROM_BE (evt->cmdid);
++      evt->cmdid = fpc32 (evt->cmdid);
+ 
+       if (0x05 != evt->cmdid)
+         {
+@@ -1885,7 +1896,7 @@
+           return -1;
+         }
+ 
+-      expect_len = GUINT32_FROM_BE (evt->length);
++      expect_len = fpc32 (evt->length);
+ 
+       received_len += len;
+ 
+@@ -2200,6 +2211,7 @@
+     }
+ 
+   productid = g_usb_device_get_pid (usb_dev);
++  fpc_le_fields = (productid == 0xA921);   /* patches/0012 */
+   // Default enroll scheme
+   self->max_immobile_stage = 0;
+   switch (productid)

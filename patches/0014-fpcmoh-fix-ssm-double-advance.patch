@@ -1,0 +1,49 @@
+fpcmoh: do not advance an SSM that has just been marked failed
+
+Both receive callbacks did this:
+
+    if (ret)
+      fpi_ssm_mark_failed (transfer->ssm, error);
+    fpi_ssm_next_state (transfer->ssm);
+
+fpi_ssm_mark_failed() sets machine->completed (or moves it to the cleanup
+state). Calling fpi_ssm_next_state() afterwards trips the guard in
+fpi-ssm.c:
+
+    BUG: (machine->completed): fpi_ssm_next_state()
+
+which aborts the daemon instead of failing the operation. On 10a5:a921 the
+init state fails routinely -- the sensor answers CMD_INIT with an event this
+driver does not parse yet -- so every attempt killed fprintd. Return after
+marking the machine failed; that path is terminal.
+
+Also apply the same rule to fpi_ssm_hello_receive_cb's -1 branch, which has
+the identical shape and would assert the same way if a hello buffer ever
+failed to parse.
+
+No behaviour change on the success path.
+
+--- a/libfprint/drivers/fpcmoh/fpc.c
++++ b/libfprint/drivers/fpcmoh/fpc.c
+@@ -1957,6 +1957,7 @@
+     {
+       fpi_ssm_mark_failed (transfer->ssm,
+                            fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
++      return;
+     }
+ 
+   fpi_ssm_next_state (transfer->ssm);
+@@ -2009,8 +2010,11 @@
+   int ret = fpc_init_evt_handler (device, transfer->buffer, transfer->actual_length);
+ 
+   if (ret)
+-    fpi_ssm_mark_failed (transfer->ssm,
+-                         fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
++    {
++      fpi_ssm_mark_failed (transfer->ssm,
++                           fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
++      return;
++    }
+ 
+   fpi_ssm_next_state (transfer->ssm);
+ }
