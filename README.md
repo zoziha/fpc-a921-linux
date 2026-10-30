@@ -77,7 +77,7 @@ systemctl show fprintd -p Environment | tr ' ' '\n' | grep IMG_FILL
 
 ## Mint 桌面接入
 
-锁屏、登录和 sudo 都走 lightdm 的 PAM 栈，只需 `/etc/pam.d/common-auth` 两行：
+登录和 sudo 走 lightdm / sudo 自己的 PAM 栈，两者都 `include common-auth`，所以只需改一处：
 
 ```
 auth  [authinfo_unavail=1 default=ignore] pam_fingwit.so
@@ -86,10 +86,37 @@ auth  [success=2 default=ignore]          pam_fprintd.so max-tries=3 timeout=15
 
 `max-tries` 是失败几次才回落到密码；默认 1 会让一次没按准就跳 PIN。
 
-两个已知粗糙处：
+### 锁屏：换掉 slick-greeter
 
-- Mint 锁屏是 slick-greeter 2.2.6，没有指纹界面。PAM 在匹配时已经成功（日志里 `gkr-pam: no password is available for user`），但 greeter 不会自己提交会话，需要按一次回车。这是 greeter 的限制；换成 PAM 成功即解锁的锁屏（如 `xfce4-screensaver`，下载约 260 kB / 安装 1.3 MB）可以绕开。
-- fprintd 1.94.3 在客户端 `Claim` 超时后会留下设备占用，Mint 指纹 App 的表现是「打不开」。`sudo systemctl restart fprintd` 即可；一次只开一个客户端。
+Mint 默认的锁屏是 light-locker 交给 lightdm 的 slick-greeter 2.2.6，它没有指纹界面：
+PAM 在匹配时已经成功（日志里 `gkr-pam: no password is available for user`，即没输密码
+就过了），但界面不会自己提交，必须点一次「登录」，提示文字也挤在一个放不下的小
+标签里。
+
+换成 XFCE 自带锁屏后，PAM 返回成功即解锁，无点击、无回车，实测从按压到回桌面约
+3 秒。体积 260 kB 下载 / 1.3 MB 安装：
+
+```bash
+sudo apt install -y xfce4-screensaver
+mkdir -p ~/.config/autostart
+printf '[Desktop Entry]\nType=Application\nName=Light Locker (disabled)\nExec=light-locker\nHidden=true\nX-GNOME-Autostart-enabled=false\n' \
+  > ~/.config/autostart/light-locker.desktop
+pkill -x light-locker
+nohup xfce4-screensaver >/dev/null 2>&1 &
+xfconf-query -c xfce4-screensaver -p /lock/enabled -n -t bool -s true
+```
+
+`Ctrl+Alt+L` 由 `xflock4` 处理，它会优先找 `xfce4-screensaver-command`，所以锁屏键
+不用改。撤销：`sudo apt remove xfce4-screensaver`，删掉那个 autostart 文件，再
+`light-locker &`。
+
+登录界面（开机时的 greeter）仍是 slick-greeter，同一条限制仍然存在；锁屏现在不受
+影响。
+
+### fprintd 的设备占用
+
+fprintd 1.94.3 在客户端 `Claim` 超时后会留下设备占用，Mint 指纹 App 的表现是
+「打不开」。`sudo systemctl restart fprintd` 即可；一次只开一个客户端。
 
 ## 仓库内容
 
