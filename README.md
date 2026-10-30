@@ -81,10 +81,13 @@ systemctl show fprintd -p Environment | tr ' ' '\n' | grep IMG_FILL
 
 ```
 auth  [authinfo_unavail=1 default=ignore] pam_fingwit.so
-auth  [success=2 default=ignore]          pam_fprintd.so max-tries=3 timeout=15
+auth  [success=2 default=ignore]          pam_fprintd.so max-tries=3 timeout=-1
 ```
 
-`max-tries` 是失败几次才回落到密码；默认 1 会让一次没按准就跳 PIN。
+`max-tries` 是失败几次才回落到密码；默认 1 会让一次没按准就跳 PIN。`timeout=-1`
+是「不设指纹窗口」：锁屏后解锁框立刻出现，人可能很久才回来，15 秒的窗口会在回来
+之前就过期（实测 15 秒后只剩 `Verification timed out` 和密码框，再按指纹没反应）。
+失败 3 次后 PAM 照样回落到密码。
 
 ### 锁屏：换掉 slick-greeter
 
@@ -120,6 +123,9 @@ nohup ~/.local/bin/xfce-lock-dialog >/dev/null 2>&1 &
 `ActiveChanged`，一上锁就 poke 一次。实测不碰键鼠，上锁后 2 秒内解锁框、头像和指纹
 提示已在屏上，按压即解锁；快捷键、菜单、挂起前的锁屏都汇到同一个信号上。fprintd
 没带中文翻译，所以这一行提示仍是英文（`Place your finger on the fingerprint reader`）。
+要强制回到指纹提示（比如挂起唤醒后 fprintd 的设备掉了），点「取消」（或 Esc）再动一下
+鼠标即可：屏幕保持锁定，只是重新拉起一次 PAM。对话框闲置 60 秒也会自己收起
+（`DIALOG_TIMEOUT_SEC`），屏幕仍是锁定状态，下次键鼠动作照样把解锁框拉回来。
 
 登录界面（开机时的 greeter）仍是 slick-greeter，同一条限制仍然存在；锁屏现在不受
 影响。
